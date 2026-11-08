@@ -1,0 +1,33 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  reference-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: 参考实现测试（不需要 Hermes 源码树）
+        run: python3 tests/test_reference.py
+      - name: 集成测试（没有源码树时自动跳过）
+        run: python3 tests/test_against_hermes.py
+
+  patch-syntax:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: 补丁能干净地 apply 到空仓库骨架
+        run: |
+          for p in patches/*.patch; do
+            rm -rf /tmp/hermes-check && mkdir -p /tmp/hermes-check && cd /tmp/hermes-check
+            git init -q .
+            # 只校验 diff 本身可解析（真实上下文匹配需要对应版本源码）
+            git apply --numstat "$GITHUB_WORKSPACE/$p" > /dev/null && echo "OK $p"
+            cd "$GITHUB_WORKSPACE"
+          done

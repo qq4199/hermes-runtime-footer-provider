@@ -1,0 +1,167 @@
+diff --git a/gateway/run_turn_persistence.py b/gateway/run_turn_persistence.py
+index 4e8cf06f330..98a806d7f0a 100644
+--- a/gateway/run_turn_persistence.py
++++ b/gateway/run_turn_persistence.py
+@@ -267,10 +267,16 @@ class GatewayTurnPersistenceMixin:
+         if finite_turn_required() is True or not automatic_notices_allowed(source):
+             return ""
+         try:
+-            from gateway.runtime_footer import build_footer_line as _bfl
++            from gateway.runtime_footer import build_footer_line as _bfl, resolve_display_provider as _rdp
++            _footer_provider = _rdp(
++                agent_result.get("provider"),
++                agent_result.get("base_url"),
++                _load_gateway_config().get("providers") or {},
++            )
+             return _bfl(
+                 user_config=_load_gateway_config(),
+                 platform_key=_platform_config_key(source.platform), model=agent_result.get("model"),
++                provider=_footer_provider,
+                 context_tokens=agent_result.get("last_prompt_tokens", 0) or 0,
+                 context_length=agent_result.get("context_length") or None,
+                 cwd=_terminal_scope_cwd(""), turn_seconds=_turn_seconds,
+diff --git a/gateway/run_turn_runner.py b/gateway/run_turn_runner.py
+index 0b296005787..fd3a030c2d3 100644
+--- a/gateway/run_turn_runner.py
++++ b/gateway/run_turn_runner.py
+@@ -1398,6 +1398,9 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
+             "model": getattr(agent, "model", None) if agent else None,
+             # Most failed results name no provider; the error card's sign-in / update-key action needs it.
+             "provider": getattr(agent, "provider", None) if agent else None,
++            # Runtime endpoint: the footer's provider field maps it back to its config key
++            # (every custom endpoint normalizes to "custom", so the name alone is ambiguous).
++            "base_url": getattr(agent, "base_url", "") if agent else "",
+             "context_length": (getattr(comp, "context_length", 0) or 0) if has_comp else 0,
+             # The rest of the `-z --usage-file` ledger (hermes_cli/oneshot._USAGE_KEYS): a finite
+             # viewer reads the committed result over `prompt.receipt`, so the projection must keep
+diff --git a/gateway/runtime_footer.py b/gateway/runtime_footer.py
+index da5eda22a31..abc51718486 100644
+--- a/gateway/runtime_footer.py
++++ b/gateway/runtime_footer.py
+@@ -1,7 +1,8 @@
+ """Gateway runtime-metadata footer (model · context % · cwd), off by default to keep replies
+ minimal. Config: ``display.runtime_footer: {enabled: bool, fields: [model, context_pct, cwd]}``
+ (order shown; drop any to hide), per-platform override ``display.platforms.<p>.runtime_footer``,
+-toggled by ``/footer on|off``. Fields: ``model`` (vendor prefix dropped), ``context_pct`` (last-call
++toggled by ``/footer on|off``. Fields: ``provider`` (resolved against ``providers.<key>.base_url``),
++``model`` (vendor prefix dropped), ``context_pct`` (last-call
+ occupancy), ``latency`` (turn wall-clock, opt-in — NOT in the default set so an unset ``fields``
+ renders exactly as before), ``served_model`` (opt-in, ``alias → served``: the deployment a routing
+ proxy reported via ``x-litellm-model-id`` / ``x-litellm-model-api-base``, or Hermes' own fallback
+@@ -37,6 +38,37 @@ def _model_short(model: Optional[str]) -> str:
+     return model.rsplit("/", 1)[-1] if model else ""
+ 
+ 
++def _provider_name(model: Optional[str]) -> str:
++    """Extract provider/vendor prefix (``openai/gpt-5.4`` → ``openai``)."""
++    if not model:
++        return ""
++    parts = model.rsplit("/", 1)
++    return parts[0] if len(parts) > 1 else ""
++
++
++def resolve_display_provider(
++    provider: Optional[str],
++    base_url: Optional[str],
++    config_providers: Optional[dict],
++) -> str:
++    """Map the normalized runtime provider name to the configured provider key.
++
++    Hermes normalizes every user-defined endpoint to ``custom`` at runtime
++    (``custom-2`` → ``custom``), so the bare provider name is ambiguous when
++    several custom endpoints are configured. Match the *actual* runtime
++    base_url against ``providers.<key>.base_url`` entries in config.yaml to
++    recover the real key; this stays correct across fallback switches too
++    (the fallback's own endpoint matches its own config key). Built-in
++    providers without a config entry fall through unchanged.
++    """
++    burl = str(base_url or "").rstrip("/")
++    if burl and isinstance(config_providers, dict):
++        for key, val in config_providers.items():
++            if isinstance(val, dict) and str(val.get("base_url") or "").rstrip("/") == burl:
++                return str(key)
++    return str(provider or "")
++
++
+ def _env_cwd() -> str:
+     try:
+         from tools.terminal_scope import terminal_env
+@@ -48,7 +80,7 @@ def _env_cwd() -> str:
+ def resolve_footer_config(user_config: dict[str, Any] | None, platform_key: str | None = None) -> dict[str, Any]:
+     """Resolve effective footer config: defaults (enabled=False) <
+     ``display.runtime_footer`` < ``display.platforms.<platform_key>.runtime_footer``."""
+-    resolved = {"enabled": False, "fields": list(_DEFAULT_FIELDS)}
++    resolved = {"enabled": False, "fields": list(_DEFAULT_FIELDS), "dash_length": 0}
+     cfg = (user_config or {}).get("display") or {}
+     plat_cfg = (cfg.get("platforms") or {}).get(platform_key) if platform_key else None
+     sections = [cfg.get("runtime_footer"), plat_cfg.get("runtime_footer") if isinstance(plat_cfg, dict) else None]
+@@ -59,6 +91,8 @@ def resolve_footer_config(user_config: dict[str, Any] | None, platform_key: str
+             resolved["enabled"] = bool(section.get("enabled"))
+         if isinstance(section.get("fields"), list) and section["fields"]:
+             resolved["fields"] = [str(f) for f in section["fields"]]
++        if section.get("dash_length"):
++            resolved["dash_length"] = int(section["dash_length"])
+     return resolved
+ 
+ 
+@@ -73,13 +107,17 @@ def _format_latency(seconds: float) -> str:
+     return f"{m}m{sec:02d}s"
+ 
+ 
+-def format_runtime_footer(*, model: Optional[str], context_tokens: int,
++def format_runtime_footer(*, model: Optional[str], provider: Optional[str] = None,
++                          context_tokens: int,
+                           context_length: Optional[int], cwd: Optional[str] = None,
+                           turn_seconds: Optional[float] = None,
+                           requested_model: Optional[str] = None, served_model: Optional[str] = None,
+-                          fields: Iterable[str] = _DEFAULT_FIELDS) -> str:
++                          fields: Iterable[str] = _DEFAULT_FIELDS,
++                          dash_length: int = 0) -> str:
+     """Render the footer line, or "" if no fields have data. Fields whose data is missing (and
+-    unknown field names) are skipped silently — a partial footer beats ``?%`` or empty slots."""
++    unknown field names) are skipped silently — a partial footer beats ``?%`` or empty slots.
++    ``dash_length`` > 0 switches the layout from the `` · `` separator to a dashed line followed
++    by the info on the next line (better on mobile)."""
+     def context_pct() -> str:
+         if context_length and context_length > 0 and context_tokens >= 0:
+             return f"{max(0, min(100, round((context_tokens / context_length) * 100)))}%"
+@@ -93,6 +131,7 @@ def format_runtime_footer(*, model: Optional[str], context_tokens: int,
+         return ""
+ 
+     renderers = {
++        "provider": lambda: (provider or _provider_name(model) or "").strip(),
+         "model": lambda: _model_short(model),
+         "served_model": served,
+         "context_pct": context_pct,
+@@ -100,11 +139,18 @@ def format_runtime_footer(*, model: Optional[str], context_tokens: int,
+         "latency": lambda: _format_latency(turn_seconds) if turn_seconds is not None and turn_seconds >= 0 else "",
+         "cwd": lambda: _home_relative_cwd(cwd or _env_cwd()),
+     }
+-    return _SEP.join(v for field in fields if (render := renderers.get(field)) and (v := render()))
++    parts = [v for field in fields if (render := renderers.get(field)) and (v := render())]
++    if not parts:
++        return ""
++    info = " / ".join(parts)
++    if dash_length and dash_length > 0:
++        return "―" * int(dash_length) + "\n" + info
++    return _SEP.join(parts)
+ 
+ 
+ def build_footer_line(*, user_config: dict[str, Any] | None, platform_key: str | None,
+-                      model: Optional[str], context_tokens: int, context_length: Optional[int],
++                      model: Optional[str], provider: Optional[str] = None,
++                      context_tokens: int, context_length: Optional[int],
+                       cwd: Optional[str] = None, turn_seconds: Optional[float] = None,
+                       requested_model: Optional[str] = None, served_model: Optional[str] = None) -> str:
+     """Entry point for gateway/run.py: footer text, or "" when disabled / no data. Callers append it
+@@ -114,7 +160,8 @@ def build_footer_line(*, user_config: dict[str, Any] | None, platform_key: str |
+     cfg = resolve_footer_config(user_config, platform_key)
+     if not cfg.get("enabled"):
+         return ""
+-    return format_runtime_footer(model=model, context_tokens=context_tokens,
++    return format_runtime_footer(model=model, provider=provider, context_tokens=context_tokens,
+                                  context_length=context_length, cwd=cwd, turn_seconds=turn_seconds,
+                                  requested_model=requested_model, served_model=served_model,
+-                                 fields=cfg.get("fields") or _DEFAULT_FIELDS)
++                                 fields=cfg.get("fields") or _DEFAULT_FIELDS,
++                                 dash_length=int(cfg.get("dash_length") or 0))
