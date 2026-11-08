@@ -15,11 +15,16 @@ if [ ! -d "$REPO/.git" ]; then
   exit 1
 fi
 
-# 按源码结构挑对应版本的补丁：v0.23+ 把 footer 调用点拆到了 run_turn_persistence.py
+# 按源码结构挑对应版本的补丁：
+#   v0.23+  footer 调用点拆到 run_turn_persistence.py
+#   v0.21.x 拆出 gateway/run_turn.py
+#   v0.20.x 全部还在 gateway/run.py（26k 行单文件）
 if [ -f "$REPO/gateway/run_turn_persistence.py" ]; then
   PATCH="$HERE/patches/v0.23.0-runtime-footer-provider.patch"
-else
+elif [ -f "$REPO/gateway/run_turn.py" ]; then
   PATCH="$HERE/patches/v0.21.x-runtime-footer-provider.patch"
+else
+  PATCH="$HERE/patches/v0.20.0-runtime-footer-provider.patch"
 fi
 
 echo "repo  : $REPO"

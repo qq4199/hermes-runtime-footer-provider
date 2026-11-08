@@ -129,8 +129,11 @@ display:
 
 | 上游版本 | 补丁 | footer 调用点 | turn 结果字典 |
 |---|---|---|---|
+| v0.20.0 | `patches/v0.20.0-runtime-footer-provider.patch` | `gateway/run.py` 内联（26,877 行单文件，调用点 ~17606） | `gateway/run.py` 的 `run_sync` 返回字典（`"model": _resolved_model,` 后补两行） |
 | v0.21.x | `patches/v0.21.x-runtime-footer-provider.patch` | `gateway/run_turn.py::_hmwa_runtime_footer_line` | `gateway/run_turn_runner.py` 的 `usage` |
 | v0.23.0（canary `93dd243`） | `patches/v0.23.0-runtime-footer-provider.patch` | `gateway/run_turn_persistence.py::_hmwa_runtime_footer_line` | 同上（`provider` 上游已有，只补 `base_url`） |
+
+没有 git 的安装（比如用打包器/应用商店装的 Hermes，源码在 site-packages 或 editable 目录）用 `patch -p1 < patches/...patch`，或者照上面三处手工改；`git apply` 需要仓库。
 
 版本差太大 `git apply` 会拒绝。三种改动的意图很短，照着上面的片段在新代码里找等价锚点手工合入即可（`grep -n "_hmwa_runtime_footer_line" gateway/*.py` 是入口）。
 
